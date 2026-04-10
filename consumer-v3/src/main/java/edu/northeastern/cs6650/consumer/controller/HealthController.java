@@ -5,7 +5,7 @@ import com.rabbitmq.client.Channel;
 import edu.northeastern.cs6650.consumer.service.MessagePersistService;
 import edu.northeastern.cs6650.consumer.service.RabbitMQConsumerService;
 import edu.northeastern.cs6650.consumer.service.RoomManager;
-import edu.northeastern.cs6650.consumer.service.ServerBroadcaster;
+import edu.northeastern.cs6650.consumer.service.RedisBroadcaster;
 import edu.northeastern.cs6650.consumer.service.StatsAggregatorService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -29,7 +29,7 @@ import org.springframework.web.bind.annotation.RestController;
 public class HealthController {
 
   private final RabbitMQConsumerService consumer;
-  private final ServerBroadcaster broadcaster;
+  private final RedisBroadcaster broadcaster;
   private final RoomManager roomManager;
   private final MessagePersistService persistService;
   private final StatsAggregatorService statsAggregator;
@@ -76,7 +76,7 @@ public class HealthController {
   private static final Logger log = LoggerFactory.getLogger(HealthController.class);
 
   public HealthController(RabbitMQConsumerService consumer,
-                          ServerBroadcaster broadcaster,
+                          RedisBroadcaster broadcaster,
                           RoomManager roomManager,
                           MessagePersistService persistService,
                           StatsAggregatorService statsAggregator) {

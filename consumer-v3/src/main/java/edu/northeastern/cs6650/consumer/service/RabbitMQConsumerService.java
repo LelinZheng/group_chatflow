@@ -60,8 +60,8 @@ public class RabbitMQConsumerService {
       )
   );
 
-  private final ServerBroadcaster broadcaster;
-  private final RoomManager       roomManager;
+  private final RedisBroadcaster   broadcaster;
+  private final RoomManager        roomManager;
   private final MessagePersistService persistService;
   private final StatsAggregatorService statsAggregator;
   private final MeterRegistry     meterRegistry;
@@ -78,7 +78,7 @@ public class RabbitMQConsumerService {
   public final AtomicLong duplicates = new AtomicLong();
   public final AtomicLong failures   = new AtomicLong();
 
-  public RabbitMQConsumerService(ServerBroadcaster broadcaster,
+  public RabbitMQConsumerService(RedisBroadcaster broadcaster,
                                  RoomManager roomManager,
                                  MessagePersistService persistService,
                                  StatsAggregatorService statsAggregator,

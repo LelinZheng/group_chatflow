@@ -9,6 +9,7 @@ import edu.northeastern.cs6650.server.dto.ErrorResponse;
 import edu.northeastern.cs6650.server.dto.QueueMessage;
 import edu.northeastern.cs6650.server.service.MessageProducer;
 import edu.northeastern.cs6650.server.service.RabbitMQProducerService;
+import edu.northeastern.cs6650.server.service.RedisSubscriber;
 import edu.northeastern.cs6650.server.service.SessionStateService;
 import edu.northeastern.cs6650.server.util.CircuitBreaker;
 import edu.northeastern.cs6650.server.util.RateLimiter;
@@ -58,6 +59,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
   private final SessionStateService stateService;
   private final MessageProducer producer;
+  private final RedisSubscriber redisSubscriber;
   private final ObjectMapper mapper;
 
   private final HttpClient httpClient = HttpClient.newBuilder()
@@ -81,9 +83,11 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
   @Value("${server.id:${random.uuid}}")
   private String serverId;
 
-  public ChatWebSocketHandler(SessionStateService stateService, MessageProducer producer) {
+  public ChatWebSocketHandler(SessionStateService stateService, MessageProducer producer,
+      RedisSubscriber redisSubscriber) {
     this.stateService = stateService;
     this.producer = producer;
+    this.redisSubscriber = redisSubscriber;
     this.mapper = new ObjectMapper().registerModule(new JavaTimeModule());
   }
 
@@ -101,6 +105,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     log.info("[CONNECT] session={} room={} roomSize={} totalConnected={}",
         session.getId(), roomId, roomSessions.get(roomId).size(), connectedNow);
 
+    redisSubscriber.subscribe(roomId);
     notifyConsumerRegister(session.getId(), roomId);
   }
 
@@ -170,15 +175,19 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
   @Override
   public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+    String roomId = sessionRoom.get(session.getId());
     cleanup(session);
     notifyConsumerUnregister(session.getId());
+    if (roomId != null) redisSubscriber.unsubscribeIfEmpty(roomId);
     log.info("[DISCONNECT] session={} status={}", session.getId(), status);
   }
 
   @Override
   public void handleTransportError(WebSocketSession session, Throwable ex) {
+    String roomId = sessionRoom.get(session.getId());
     cleanup(session);
     notifyConsumerUnregister(session.getId());
+    if (roomId != null) redisSubscriber.unsubscribeIfEmpty(roomId);
     log.error("[TRANSPORT_ERROR] session={} error={}", session.getId(), ex.getMessage());
   }
 
