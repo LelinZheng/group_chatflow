@@ -8,6 +8,11 @@ spring:
   application:
     name: server-v2
 
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
   profiles:
     active: ${APP_ENV:local-rabbit}
 
