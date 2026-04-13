@@ -7,15 +7,18 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -37,6 +40,7 @@ public class MessagePersistService {
   @Value("${db.writer.circuit-half-open-max-calls:3}") private int cbHalfOpenCalls;
 
   private final MessageWriteRepository repository;
+  private final StringRedisTemplate redisTemplate;
   private CircuitBreaker circuitBreaker;
 
   private BlockingQueue<QueueMessage> writeQueue;
@@ -48,8 +52,9 @@ public class MessagePersistService {
   private final AtomicLong failed = new AtomicLong(0);
   private final AtomicLong dlqCount = new AtomicLong(0);
 
-  public MessagePersistService(MessageWriteRepository repository) {
+  public MessagePersistService(MessageWriteRepository repository, StringRedisTemplate redisTemplate) {
     this.repository = repository;
+    this.redisTemplate = redisTemplate;
   }
 
   @PostConstruct
@@ -118,6 +123,7 @@ public class MessagePersistService {
         repository.insertBatch(batch);
         persisted.addAndGet(batch.size());
         circuitBreaker.onSuccess();
+        evictRoomCache(batch);
         return;
       } catch (Exception e) {
         circuitBreaker.onFailure();
@@ -134,6 +140,19 @@ public class MessagePersistService {
           return;
         }
         backoff = Math.min(backoff * 2, 5_000);
+      }
+    }
+  }
+
+  private void evictRoomCache(List<QueueMessage> batch) {
+    Set<String> roomIds = batch.stream()
+        .map(QueueMessage::getRoomId)
+        .collect(Collectors.toSet());
+    for (String roomId : roomIds) {
+      Set<String> keys = redisTemplate.keys("room:" + roomId + ":*");
+      if (keys != null && !keys.isEmpty()) {
+        redisTemplate.delete(keys);
+        log.debug("[CACHE_EVICT] roomId={} keys={}", roomId, keys.size());
       }
     }
   }
