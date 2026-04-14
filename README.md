@@ -106,6 +106,13 @@ This script profiles:
 Compare execution time, scanned rows, and whether the query plan is using
 the expected indexes or pre-aggregated materialized views.
 
+### Before/After Measurement
+
+For a repeatable process to measure analytics query latency and throughput
+before and after the optimization, see:
+
+- `database/measurement_guide.md`
+
 ---
 
 ### Stop Services
