@@ -6,6 +6,7 @@ import edu.northeastern.cs6650.consumer.dto.RoomActivity;
 import edu.northeastern.cs6650.consumer.dto.TimeBucketCount;
 import edu.northeastern.cs6650.consumer.util.AnalyticsCache;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,6 +16,8 @@ import org.springframework.stereotype.Service;
 
 @Service
 public class AnalyticsService {
+  private static final Duration MATERIALIZED_VIEW_WINDOW = Duration.ofHours(24);
+  private static final Duration VIEW_RANGE_TOLERANCE = Duration.ofMinutes(1);
 
   private static final RowMapper<MessageRecord> MESSAGE_MAPPER = (rs, i) -> new MessageRecord(
       rs.getString("message_id"),
@@ -91,13 +94,25 @@ public class AnalyticsService {
 
   public List<TimeBucketCount> messagesPerMinute(Instant start, Instant end) {
     String key = "perMinute:" + start + ":" + end;
-    return cache.get(key, () -> jdbcTemplate.query("""
-        SELECT date_trunc('minute', created_at) AS bucket, COUNT(*) AS cnt
-        FROM messages
-        WHERE created_at BETWEEN ? AND ?
-        GROUP BY bucket
-        ORDER BY bucket
-        """, BUCKET_MAPPER, ts(start), ts(end)));
+    return cache.get(key, () -> {
+      Instant now = Instant.now();
+      if (canUsePerMinuteView(start, end, now)) {
+        return jdbcTemplate.query("""
+            SELECT bucket, message_count AS cnt
+            FROM mv_messages_per_minute
+            WHERE bucket BETWEEN date_trunc('minute', CAST(? AS timestamptz))
+                AND date_trunc('minute', CAST(? AS timestamptz))
+            ORDER BY bucket
+            """, BUCKET_MAPPER, ts(start), ts(end));
+      }
+      return jdbcTemplate.query("""
+          SELECT date_trunc('minute', created_at) AS bucket, COUNT(*) AS cnt
+          FROM messages
+          WHERE created_at BETWEEN ? AND ?
+          GROUP BY bucket
+          ORDER BY bucket
+          """, BUCKET_MAPPER, ts(start), ts(end));
+    });
   }
 
   public List<TimeBucketCount> messagesPerSecond(Instant start, Instant end) {
@@ -113,26 +128,48 @@ public class AnalyticsService {
 
   public List<IdCount> topUsers(Instant start, Instant end, int limit) {
     String key = "topUsers:" + start + ":" + end + ":" + limit;
-    return cache.get(key, () -> jdbcTemplate.query("""
-        SELECT user_id AS id, COUNT(*) AS cnt
-        FROM messages
-        WHERE created_at BETWEEN ? AND ?
-        GROUP BY user_id
-        ORDER BY cnt DESC
-        LIMIT ?
-        """, ID_COUNT_MAPPER, ts(start), ts(end), limit));
+    return cache.get(key, () -> {
+      Instant now = Instant.now();
+      if (canUseRolling24HourAggregateView(start, end, now)) {
+        return jdbcTemplate.query("""
+            SELECT user_id AS id, message_count AS cnt
+            FROM mv_top_users
+            ORDER BY message_count DESC, user_id
+            LIMIT ?
+            """, ID_COUNT_MAPPER, limit);
+      }
+      return jdbcTemplate.query("""
+          SELECT user_id AS id, COUNT(*) AS cnt
+          FROM messages
+          WHERE created_at BETWEEN ? AND ?
+          GROUP BY user_id
+          ORDER BY cnt DESC
+          LIMIT ?
+          """, ID_COUNT_MAPPER, ts(start), ts(end), limit);
+    });
   }
 
   public List<IdCount> topRooms(Instant start, Instant end, int limit) {
     String key = "topRooms:" + start + ":" + end + ":" + limit;
-    return cache.get(key, () -> jdbcTemplate.query("""
-        SELECT room_id AS id, COUNT(*) AS cnt
-        FROM messages
-        WHERE created_at BETWEEN ? AND ?
-        GROUP BY room_id
-        ORDER BY cnt DESC
-        LIMIT ?
-        """, ID_COUNT_MAPPER, ts(start), ts(end), limit));
+    return cache.get(key, () -> {
+      Instant now = Instant.now();
+      if (canUseRolling24HourAggregateView(start, end, now)) {
+        return jdbcTemplate.query("""
+            SELECT room_id AS id, message_count AS cnt
+            FROM mv_top_rooms
+            ORDER BY message_count DESC, room_id
+            LIMIT ?
+            """, ID_COUNT_MAPPER, limit);
+      }
+      return jdbcTemplate.query("""
+          SELECT room_id AS id, COUNT(*) AS cnt
+          FROM messages
+          WHERE created_at BETWEEN ? AND ?
+          GROUP BY room_id
+          ORDER BY cnt DESC
+          LIMIT ?
+          """, ID_COUNT_MAPPER, ts(start), ts(end), limit);
+    });
   }
 
   public List<IdCount> participationByRoom(String userId, Instant start, Instant end) {
@@ -148,6 +185,20 @@ public class AnalyticsService {
 
   private static Timestamp ts(Instant instant) {
     return Timestamp.from(instant);
+  }
+
+  private boolean canUsePerMinuteView(Instant start, Instant end, Instant now) {
+    Instant cutoff = now.minus(MATERIALIZED_VIEW_WINDOW);
+    return !start.isBefore(cutoff) && !end.isAfter(now);
+  }
+
+  private boolean canUseRolling24HourAggregateView(Instant start, Instant end, Instant now) {
+    Instant cutoff = now.minus(MATERIALIZED_VIEW_WINDOW);
+    return isWithinTolerance(start, cutoff) && isWithinTolerance(end, now);
+  }
+
+  private boolean isWithinTolerance(Instant actual, Instant expected) {
+    return Duration.between(actual, expected).abs().compareTo(VIEW_RANGE_TOLERANCE) <= 0;
   }
 
   private static Instant toInstant(Timestamp ts) {
