@@ -88,6 +88,24 @@ cd monitoring
 ./watch-metrics-local.sh
 ```
 
+### Query Profiling
+
+Use PostgreSQL `EXPLAIN ANALYZE` to compare raw-table analytics queries
+against the materialized-view-backed versions:
+
+```bash
+cd database
+psql "postgresql://admin:admin@localhost:5432/chatflow" -f explain_analytics.sql
+```
+
+This script profiles:
+- messages per minute over the last 24 hours
+- top users over the last 24 hours
+- top rooms over the last 24 hours
+
+Compare execution time, scanned rows, and whether the query plan is using
+the expected indexes or pre-aggregated materialized views.
+
 ---
 
 ### Stop Services
