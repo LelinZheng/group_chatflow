@@ -55,6 +55,9 @@ stats:
 
 analytics:
   cache-ttl-ms: ${ANALYTICS_CACHE_TTL_MS:5000}
+  refresh-enabled: ${ANALYTICS_REFRESH_ENABLED:true}
+  refresh-interval-ms: ${ANALYTICS_REFRESH_INTERVAL_MS:60000}
+  refresh-initial-delay-ms: ${ANALYTICS_REFRESH_INITIAL_DELAY_MS:30000}
 
 management:
   endpoints:
