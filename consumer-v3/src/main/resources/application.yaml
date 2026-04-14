@@ -54,7 +54,9 @@ stats:
   queue-capacity: ${STATS_QUEUE_CAPACITY:50000}
 
 analytics:
-  cache-ttl-ms: ${ANALYTICS_CACHE_TTL_MS:5000}
+  refresh-enabled: ${ANALYTICS_REFRESH_ENABLED:true}
+  refresh-interval-ms: ${ANALYTICS_REFRESH_INTERVAL_MS:60000}
+  refresh-initial-delay-ms: ${ANALYTICS_REFRESH_INITIAL_DELAY_MS:30000}
   room-messages-ttl-ms: ${ANALYTICS_ROOM_TTL_MS:3000}
   user-history-ttl-ms: ${ANALYTICS_USER_TTL_MS:10000}
   aggregation-ttl-ms: ${ANALYTICS_AGG_TTL_MS:5000}
