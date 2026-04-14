@@ -1,99 +1,288 @@
 # Analytics Before/After Measurement Guide
 
-This guide captures a repeatable way to measure the effect of the analytics
-materialized view optimization on query latency and overall system throughput.
+This guide explains how to run the project's local load test and compare
+before/after results for analytics latency and overall throughput.
 
-## Goal
+The load test driver in this repository is the `client` module. It opens
+WebSocket connections to `server-v2`, sends a warmup phase plus a main load
+phase, writes latency metrics to `client/results/`, and finally calls the
+consumer analytics API.
+
+## What You Are Measuring
 
 Compare two scenarios:
 
-1. Baseline: analytics queries against the raw `messages` table
-2. Optimized: analytics queries using materialized views with scheduled refresh
+1. Baseline: analytics queries served from the raw `messages` table
+2. Optimized: analytics queries served from materialized views with scheduled
+   refresh enabled
 
-Record both:
+For both scenarios, record:
 
-- query latency
-- write/processing throughput under load
+- analytics query latency from PostgreSQL `EXPLAIN ANALYZE`
+- client-observed message latency and throughput
+- consumer and database health during load
 
-## Recommended Setup
+## Services Needed
 
-- Start local dependencies with Docker:
+For local measurement, run:
+
+- Docker services from `deployment/docker-compose.yml`
+  - PostgreSQL
+  - RabbitMQ
+  - Redis
+- `server-v2`
+- `consumer-v3`
+- `client`
+
+## Step 1: Start Local Dependencies
+
+From the repo root:
 
 ```bash
 cd deployment
 docker-compose up -d
+docker ps
 ```
 
-- Initialize the database schema, indexes, and materialized views
-- Start `consumer-v3`
-- Start `server-v2`
-- Use the existing load-test configs under `load-tests/configs/`
+Confirm these containers are running:
 
-## Query Latency Measurement
+- `chatflow-db`
+- `rabbitmq`
+- `chatflow-redis`
 
-### Baseline
+## Step 2: Initialize the Database
 
-Use the raw-table queries in `database/explain_analytics.sql` and record:
+From the repo root:
 
-- planning time
+```bash
+cd database
+docker exec -i chatflow-db psql -U admin -d chatflow < schema.sql
+docker exec -i chatflow-db psql -U admin -d chatflow < indexes.sql
+docker exec -i chatflow-db psql -U admin -d chatflow < materialized_views.sql
+```
+
+If you want to start from a clean local database first:
+
+```bash
+cd deployment
+docker-compose down -v
+docker-compose up -d
+cd ../database
+docker exec -i chatflow-db psql -U admin -d chatflow < schema.sql
+docker exec -i chatflow-db psql -U admin -d chatflow < indexes.sql
+docker exec -i chatflow-db psql -U admin -d chatflow < materialized_views.sql
+```
+
+## Step 3: Start the Consumer
+
+Open a dedicated terminal:
+
+```bash
+cd consumer-v3
+GRADLE_USER_HOME=/tmp/gradle-group-chatflow ./gradlew bootRun \
+  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin --spring.data.redis.host=localhost --spring.data.redis.port=6379'
+```
+
+For faster local verification of automatic refresh, you can temporarily shorten
+the refresh interval:
+
+```bash
+cd consumer-v3
+GRADLE_USER_HOME=/tmp/gradle-group-chatflow ./gradlew bootRun \
+  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin --spring.data.redis.host=localhost --spring.data.redis.port=6379 --analytics.refresh-enabled=true --analytics.refresh-initial-delay-ms=1000 --analytics.refresh-interval-ms=5000'
+```
+
+Verify:
+
+```bash
+curl http://localhost:8081/health
+```
+
+## Step 4: Start the Server
+
+Open another terminal:
+
+```bash
+cd server-v2
+GRADLE_USER_HOME=/tmp/gradle-group-chatflow ./gradlew bootRun \
+  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin --spring.data.redis.host=localhost --spring.data.redis.port=6379 --server.url=http://localhost:8080 --consumer.url=http://localhost:8081'
+```
+
+Verify:
+
+```bash
+curl http://localhost:8080/health
+```
+
+## Step 5: Open Monitoring Terminals
+
+Open one or two extra terminals before starting the load test.
+
+### Consumer metrics
+
+```bash
+cd monitoring
+./watch-metrics-local.sh
+```
+
+This watches `http://localhost:8081/metrics` every 2 seconds.
+
+### Database metrics
+
+```bash
+cd monitoring
+DB_NAME=chatflow DB_USER=admin DB_HOST=localhost DB_PORT=5432 ./watch-db-metrics-local.sh
+```
+
+This prints:
+
+- active DB connections
+- transaction count
+- block reads and hits
+- buffer hit ratio
+- lock counts
+
+## Step 6: Run Query Profiling
+
+Before and after the optimization, run:
+
+```bash
+cd database
+docker exec -i chatflow-db psql -U admin -d chatflow < explain_analytics.sql | tee explain_output.txt
+```
+
+To quickly inspect the key lines:
+
+```bash
+rg "Baseline|Materialized|Execution Time" explain_output.txt
+```
+
+Watch for:
+
 - execution time
-- rows scanned
-- whether PostgreSQL uses sequential scan, index scan, or aggregate nodes
+- whether the plan scans `messages` or `mv_*`
+- whether small datasets distort the comparison
 
-### Optimized
+## Step 7: Run the Load Test
 
-Run the same script after:
+The load test entrypoint is the `client` module. The client supports runtime
+configuration through environment variables.
 
-- enabling the Task 1 analytics service changes
-- ensuring materialized views are created
-- refreshing the materialized views with:
+Important variables:
 
-```sql
-SELECT refresh_analytics_views();
+- `SERVER_HOST`
+- `SERVER_PORT`
+- `METRICS_HOST`
+- `METRICS_PORT`
+- `TOTAL_MESSAGES`
+- `MAIN_THREADS`
+
+The client already includes:
+
+- warmup phase: `32` threads x `1000` messages each
+- main load phase: controlled by `TOTAL_MESSAGES` and `MAIN_THREADS`
+
+### Baseline run
+
+From the repo root:
+
+```bash
+cd client
+SERVER_HOST=localhost \
+SERVER_PORT=8080 \
+METRICS_HOST=localhost \
+METRICS_PORT=8081 \
+TOTAL_MESSAGES=500000 \
+MAIN_THREADS=128 \
+GRADLE_USER_HOME=/tmp/gradle-group-chatflow \
+./gradlew run
 ```
 
-Record the same metrics and compare:
+### Stress run
 
-- raw table execution time vs materialized view execution time
-- relative improvement or regression
+From the repo root:
 
-## Throughput Measurement
+```bash
+cd client
+SERVER_HOST=localhost \
+SERVER_PORT=8080 \
+METRICS_HOST=localhost \
+METRICS_PORT=8081 \
+TOTAL_MESSAGES=1000000 \
+MAIN_THREADS=256 \
+GRADLE_USER_HOME=/tmp/gradle-group-chatflow \
+./gradlew run
+```
 
-Use one of the existing load-test configs, for example:
+These values match the intent of:
 
 - `load-tests/configs/baseline.json`
 - `load-tests/configs/stress.json`
 
-For each run, capture:
+## Step 8: Capture Client Results
 
-- messages published per second
-- messages persisted per second
-- consumer queue depth
-- DB writer queue depth
-- analytics API latency during load
+After each run, the client writes:
 
-## Suggested Run Order
+- latency CSV:
+  - `client/results/performance_metrics<threads>.csv`
+- analytics API response:
+  - `client/results/metrics_api_response.json`
 
-1. Start with baseline code path and collect:
-   - `EXPLAIN ANALYZE` results
-   - load-test throughput metrics
-2. Switch to optimized code path and collect the same metrics
-3. Keep the dataset size and load-test config the same
-4. Compare results side by side
+The client console output also prints:
 
-## What to Watch
+- successful vs failed messages
+- overall throughput
+- p50 / p95 / p99 latency
+- room throughput
+- throughput over time in 10-second buckets
 
-- If execution time improves for `messages per minute`, `top users`, and
-  `top rooms`, the materialized views are helping analytics latency
-- If throughput drops sharply after enabling frequent refresh, the refresh
-  interval may be too aggressive
-- If small datasets show no gain or even slight regressions, repeat the test
-  with larger data volume before drawing conclusions
+## Step 9: Compare Before and After
 
-## Practical Notes
+Keep the dataset size and load settings the same across runs.
 
-- Small datasets can make raw-table queries appear faster because planning and
-  sort overhead dominate the measurement
-- Test with representative data volume before tuning refresh intervals
-- A 60-second refresh interval is a reasonable default for local or moderate
-  load; shorter intervals should be justified by observed latency needs
+For each scenario, compare:
+
+- `EXPLAIN ANALYZE` execution time
+- client overall throughput
+- client p50 / p95 / p99 latency
+- consumer queue depth during load
+- DB buffer hit ratio and active connections
+- final analytics API response written to `client/results/metrics_api_response.json`
+
+## Suggested Workflow
+
+### Baseline
+
+Use a code state where analytics queries still read from the raw `messages`
+table, then run:
+
+1. database initialization
+2. consumer
+3. server
+4. monitoring scripts
+5. `docker exec -i chatflow-db psql -U admin -d chatflow < explain_analytics.sql`
+6. `cd client && ... ./gradlew run`
+
+### Optimized
+
+Use the feature branch with Tasks 1-4, then repeat the exact same sequence.
+
+## Interpreting Results
+
+- If `messages per minute`, `top users`, and `top rooms` execute faster from
+  `mv_*`, the optimization helps query latency
+- If client throughput is unchanged or improves while analytics latency drops,
+  the feature is a net win
+- If very frequent refresh causes queue depth or DB pressure to spike, increase
+  `analytics.refresh-interval-ms`
+- If small datasets show little gain, repeat with larger data volume before
+  judging the optimization
+
+## Related Files
+
+- `database/explain_analytics.sql`
+- `load-tests/configs/baseline.json`
+- `load-tests/configs/stress.json`
+- `monitoring/watch-metrics-local.sh`
+- `monitoring/watch-db-metrics-local.sh`
+- `client/results/`
