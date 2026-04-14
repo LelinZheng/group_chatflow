@@ -131,7 +131,7 @@ This watches `http://localhost:8081/metrics` every 2 seconds.
 
 ```bash
 cd monitoring
-DB_NAME=chatflow DB_USER=admin DB_HOST=localhost DB_PORT=5432 ./watch-db-metrics-local.sh
+DB_NAME=chatflow DB_USER=admin DB_PASSWORD=admin DB_HOST=localhost DB_PORT=5432 ./watch-db-metrics-local.sh
 ```
 
 This prints:
