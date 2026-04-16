@@ -1,35 +1,67 @@
-# cs6650-assignment2
+# Group ChatFlow — Distributed Chat System
+
+A high-throughput real-time chat system built for CS6650 (Distributed Systems). The architecture is designed for horizontal scalability and optimized analytics via PostgreSQL materialized views, Redis caching, and asynchronous message processing through RabbitMQ.
+
+## Architecture Overview
+
+```
+Clients (WebSocket)
+        │
+        ▼
+AWS Application Load Balancer (HTTP :80, sticky sessions)
+        │
+   ┌────┴────┐
+   │         │  (round-robin across 4 instances)
+Server-v2 ×4 (Spring Boot, :8080)
+   │    │
+   │    └──── Redis (session state, pub-sub, analytics cache)
+   │
+RabbitMQ (:5672)
+   │
+Consumer-v3 (Spring Boot, :8081)
+   │    │
+   │    └──── Redis (analytics cache)
+   │
+PostgreSQL (:5432)
+   │
+   ├── messages table (indexes: room_time, user_time, user_room_time)
+   └── Materialized views (mv_top_users, mv_top_rooms, mv_messages_per_minute)
+```
+
+**Services:**
+| Service | Role | Port |
+|---|---|---|
+| server-v2 | WebSocket server — accepts chat connections, produces to RabbitMQ | 8080 |
+| consumer-v3 | Message consumer — batch-writes to PostgreSQL, serves analytics API | 8081 |
+| PostgreSQL | Persistent message store with optimized analytics queries | 5432 |
+| RabbitMQ | Async message queue decoupling servers from DB writes | 5672 / 15672 |
+| Redis | Session state, cross-server pub-sub, analytics result caching | 6379 |
+
+---
 
 ## Local Development
 
 ### Prerequisites
-- Java 17+
+- Java 21
 - Gradle
 - Docker & Docker Compose
 
 ---
 
-### Step 1: Install Docker
+### Step 1: Start Infrastructure (RabbitMQ + PostgreSQL + Redis)
 
 ```bash
 cd deployment
-chmod +x install-docker.sh
-./install-docker.sh
-```
-
----
-
-### Step 2: Start RabbitMQ + Postgres
-
-```bash
-# still in deployment/
 docker-compose up -d
 ```
 
-RabbitMQ Management Console: http://localhost:15672 (admin / admin)
-Postgres: localhost:5432 (chatflow / chatflow)
+| Service | URL / Address | Credentials |
+|---|---|---|
+| RabbitMQ Management | http://localhost:15672 | admin / admin |
+| PostgreSQL | localhost:5432 | admin / admin, db: chatflow |
+| Redis | localhost:6379 | — |
 
-Initialize schema:
+Initialize the database schema and indexes:
 ```bash
 cd database
 ./setup.sh
@@ -37,34 +69,40 @@ cd database
 
 ---
 
-### Step 3: Start Server
+### Step 2: Start Server
 
 ```bash
 cd server-v2
 ./gradlew clean build -x test
 ./gradlew bootRun \
-  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin --server.url=http://localhost:8080 --consumer.url=http://localhost:8081'
+  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 \
+          --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin \
+          --spring.redis.host=localhost --spring.redis.port=6379 \
+          --server.url=http://localhost:8080 --consumer.url=http://localhost:8081'
 ```
 
 Verify: http://localhost:8080/health
 
 ---
 
-### Step 4: Start Consumer (v3)
+### Step 3: Start Consumer (v3)
 
 ```bash
 cd consumer-v3
 ./gradlew clean build -x test
 ./gradlew bootRun \
-  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin --consumer.thread-count=20'
+  --args='--spring.rabbitmq.host=localhost --spring.rabbitmq.port=5672 \
+          --spring.rabbitmq.username=admin --spring.rabbitmq.password=admin \
+          --spring.redis.host=localhost --spring.redis.port=6379 \
+          --consumer.thread-count=40'
 ```
 
-Verify: http://localhost:8081/health
+Verify: http://localhost:8081/health  
 Analytics API: http://localhost:8081/metrics/analytics
 
 ---
 
-### Step 5: Build & Run Client
+### Step 4: Build & Run Load Test Client
 
 ```bash
 cd client
@@ -72,46 +110,53 @@ cd client
 java -jar build/libs/client-0.1.0.jar
 ```
 
-Results will be saved to `client/results/`
-Metrics API response will be saved to `client/results/metrics_api_response.json`
+Results are saved to `client/results/`.  
+Metrics API response is saved to `client/results/metrics_api_response.json`.
+
+Load test configs (thread count, message count, room/user distribution) are in `load-tests/configs/`:
+- `baseline.json` — 500k messages, 128 threads, 20 rooms, 100k users
+- `stress.json` — 1M messages, 256 threads
+- `batch-size-tests.json` — batch size parameter sweep
+- `endurance.json` — 15-minute sustained run at 80% throughput
 
 ---
 
 ### Monitoring
 
 ```bash
-# one-time snapshot
 cd monitoring
+
+# one-time snapshot
 ./check-metrics-local.sh
 
 # live (requires: brew install watch)
 ./watch-metrics-local.sh
+
+# analytics-specific
+./check-analytics.sh
+
+# RabbitMQ queue depth
+./check-queue-depth.sh
+
+# database metrics
+./check-db-metrics-local.sh
 ```
+
+---
 
 ### Query Profiling
 
-Use PostgreSQL `EXPLAIN ANALYZE` to compare raw-table analytics queries
-against the materialized-view-backed versions:
+Compare raw-table analytics queries against materialized-view-backed versions:
 
 ```bash
 cd database
 psql "postgresql://admin:admin@localhost:5432/chatflow" -f explain_analytics.sql
 ```
 
-This script profiles:
-- messages per minute over the last 24 hours
-- top users over the last 24 hours
-- top rooms over the last 24 hours
+This profiles: messages per minute, top users, and top rooms over the last 24 hours.  
+Compare execution time, scanned rows, and whether the planner uses indexes or pre-aggregated views.
 
-Compare execution time, scanned rows, and whether the query plan is using
-the expected indexes or pre-aggregated materialized views.
-
-### Before/After Measurement
-
-For a repeatable process to measure analytics query latency and throughput
-before and after the optimization, see:
-
-- `database/measurement_guide.md`
+For a repeatable before/after measurement process, see `database/measurement_guide.md`.
 
 ---
 
@@ -119,7 +164,6 @@ before and after the optimization, see:
 
 Press `Ctrl+C` in each terminal to stop the server and consumer.
 
-To stop RabbitMQ:
 ```bash
 cd deployment
 docker-compose down -v
@@ -129,88 +173,82 @@ docker-compose down -v
 
 ## EC2 Deployment
 
+### Infrastructure
+
+| Instance | Role | Count |
+|---|---|---|
+| Server EC2 | server-v2 on :8080 | 4 |
+| Consumer EC2 | consumer-v3 on :8081 | 1 |
+| PostgreSQL EC2 | PostgreSQL on :5432 | 1 |
+| RabbitMQ EC2 | RabbitMQ on :5672 | 1 |
+| Redis EC2 | Redis on :6379 | 1 |
+| AWS ALB | HTTP :80 → servers :8080, sticky sessions, `/health` check | 1 |
+
+ALB DNS: `chat-servers-1288018322.us-west-2.elb.amazonaws.com`
+
 ### Prerequisites
-Replace the following placeholders with actual values:
+
+Replace the following placeholders throughout:
 - `<path-to-your-pem-key>` — path to your EC2 key file
-- `<Server1-Public-IP>` — Server 1
-- `<Server2-Public-IP>` — Server 2
-- `<Server3-Public-IP>` — Server 3
-- `<Server4-Public-IP>` — Server 4
-- `<Consumer-Public-IP>` — Consumer
-- `<Postgres-Public-IP>` — PostgresSQL
-- `<RabbitMQ-Public-IP>` — RabbitMQ
+- `<Server1-Public-IP>` through `<Server4-Public-IP>` — 4 server instances
+- `<Consumer-Public-IP>` — consumer instance
+- `<Postgres-Public-IP>` — PostgreSQL instance
+- `<RabbitMQ-Public-IP>` — RabbitMQ instance
+- `<Redis-Public-IP>` — Redis instance
 
 ---
 
-### Step 1: Build & Deploy RabbitMQ and PostgreSQL
+### Step 1: Deploy RabbitMQ and PostgreSQL
 
 ```bash
-scp -i <path-to-your-pem-key> deployment/install-docker.sh ubuntu@<RabbitMQ-Public-IP>:~/
-scp -i <path-to-your-pem-key> deployment/docker-compose.yml ubuntu@<RabbitMQ-Public-IP>:~/
-
-# First time only: install Docker
+# RabbitMQ
+scp -i <path-to-your-pem-key> deployment/install-docker.sh deployment/docker-compose.yml ubuntu@<RabbitMQ-Public-IP>:~/
 ssh -i <path-to-your-pem-key> ubuntu@<RabbitMQ-Public-IP> "chmod +x install-docker.sh && ./install-docker.sh"
-
-# Start RabbitMQ
 ssh -i <path-to-your-pem-key> ubuntu@<RabbitMQ-Public-IP> "docker-compose up rabbitmq -d"
+
+# PostgreSQL
+scp -i <path-to-your-pem-key> deployment/install-docker.sh deployment/docker-compose.yml ubuntu@<Postgres-Public-IP>:~/
+ssh -i <path-to-your-pem-key> ubuntu@<Postgres-Public-IP> "chmod +x install-docker.sh && ./install-docker.sh"
+ssh -i <path-to-your-pem-key> ubuntu@<Postgres-Public-IP> "docker-compose up postgres -d"
 ```
 
+Initialize the database schema:
 ```bash
-scp -i <path-to-your-pem-key> deployment/install-docker.sh ubuntu@<Postgres-Public-IP>:~/
-scp -i <path-to-your-pem-key> deployment/docker-compose.yml ubuntu@<Postgres-Public-IP>:~/
-
-# First time only: install Docker
-ssh -i <path-to-your-pem-key> ubuntu@<Postgres-Public-IP> "chmod +x install-docker.sh && ./install-docker.sh"
-
-# Start PostgresSQL
-ssh -i <path-to-your-pem-key> ubuntu@<RabbitMQ-Public-IP> "docker-compose up postgres -d"
+scp -i <path-to-your-pem-key> database/setup.sh database/schema.sql database/indexes.sql database/materialized_views.sql ubuntu@<Postgres-Public-IP>:~/
+ssh -i <path-to-your-pem-key> ubuntu@<Postgres-Public-IP> "chmod +x setup.sh && ./setup.sh"
 ```
 
 ---
 
-### Step 2: Build & Deploy & Start Servers
+### Step 2: Deploy Redis
+
+```bash
+scp -i <path-to-your-pem-key> deployment/install-docker.sh deployment/docker-compose.yml ubuntu@<Redis-Public-IP>:~/
+ssh -i <path-to-your-pem-key> ubuntu@<Redis-Public-IP> "chmod +x install-docker.sh && ./install-docker.sh"
+ssh -i <path-to-your-pem-key> ubuntu@<Redis-Public-IP> "docker-compose up redis -d"
+```
+
+---
+
+### Step 3: Build & Deploy Servers
 
 ```bash
 cd server-v2
 ./gradlew clean build -x test
 cd ..
 
-# Server 1
-scp -i <path-to-your-pem-key> server-v2/build/libs/server-v2-0.0.1-SNAPSHOT.jar ubuntu@<Server1-Public-IP>:~/
-scp -i <path-to-your-pem-key> deployment/install-java.sh deployment/start-server1.sh deployment/stop-server.sh ubuntu@<Server1-Public-IP>:~/
-# Step 1: Install Java
-ssh -i <path-to-your-pem-key> ubuntu@<Server1-Public-IP> "chmod +x install-java.sh start-server1.sh stop-server.sh && ./install-java.sh"
-# Step 2: Start Server
-ssh -i <path-to-your-pem-key> ubuntu@<Server1-Public-IP> "./start-server1.sh"
-
-# Server 2
-scp -i <path-to-your-pem-key> server-v2/build/libs/server-v2-0.0.1-SNAPSHOT.jar ubuntu@<Server2-Public-IP>:~/
-scp -i <path-to-your-pem-key> deployment/install-java.sh deployment/start-server2.sh deployment/stop-server.sh ubuntu@<Server2-Public-IP>:~/
-# Step 1: Install Java
-ssh -i <path-to-your-pem-key> ubuntu@<Server2-Public-IP> "chmod +x install-java.sh start-server2.sh stop-server.sh && ./install-java.sh"
-# Step 2: Start Server
-ssh -i <path-to-your-pem-key> ubuntu@<Server2-Public-IP> "./start-server2.sh"
-
-# Server 3
-scp -i <path-to-your-pem-key> server-v2/build/libs/server-v2-0.0.1-SNAPSHOT.jar ubuntu@<Server3-Public-IP>:~/
-scp -i <path-to-your-pem-key> deployment/install-java.sh deployment/start-server3.sh deployment/stop-server.sh ubuntu@<Server3-Public-IP>:~/
-# Step 1: Install Java
-ssh -i <path-to-your-pem-key> ubuntu@<Server3-Public-IP> "chmod +x install-java.sh start-server3.sh stop-server.sh && ./install-java.sh"
-# Step 2: Start Server
-ssh -i <path-to-your-pem-key> ubuntu@<Server3-Public-IP> "./start-server3.sh"
-
-# Server 4
-scp -i <path-to-your-pem-key> server-v2/build/libs/server-v2-0.0.1-SNAPSHOT.jar ubuntu@<Server4-Public-IP>:~/
-scp -i <path-to-your-pem-key> deployment/install-java.sh deployment/start-server4.sh deployment/stop-server.sh ubuntu@<Server4-Public-IP>:~/
-# Step 1: Install Java
-ssh -i <path-to-your-pem-key> ubuntu@<Server4-Public-IP> "chmod +x install-java.sh start-server4.sh stop-server.sh && ./install-java.sh"
-# Step 2: Start Server
-ssh -i <path-to-your-pem-key> ubuntu@<Server4-Public-IP> "./start-server4.sh"
+# Repeat for Server 1–4, substituting the server number and IP
+for N in 1 2 3 4; do
+  scp -i <path-to-your-pem-key> server-v2/build/libs/server-v2-0.0.1-SNAPSHOT.jar ubuntu@<ServerN-Public-IP>:~/
+  scp -i <path-to-your-pem-key> deployment/install-java.sh deployment/start-server${N}.sh deployment/stop-server.sh ubuntu@<ServerN-Public-IP>:~/
+  ssh -i <path-to-your-pem-key> ubuntu@<ServerN-Public-IP> "chmod +x install-java.sh start-server${N}.sh stop-server.sh && ./install-java.sh"
+  ssh -i <path-to-your-pem-key> ubuntu@<ServerN-Public-IP> "./start-server${N}.sh"
+done
 ```
 
 ---
 
-### Step 3: Build & Deploy & Start Consumer
+### Step 4: Build & Deploy Consumer
 
 ```bash
 cd consumer-v3
@@ -219,15 +257,13 @@ cd ..
 
 scp -i <path-to-your-pem-key> consumer-v3/build/libs/consumer-v3-0.0.1-SNAPSHOT.jar ubuntu@<Consumer-Public-IP>:~/
 scp -i <path-to-your-pem-key> deployment/install-java.sh deployment/start-consumer.sh deployment/stop-consumer.sh ubuntu@<Consumer-Public-IP>:~/
-# Step 1: Install Java
 ssh -i <path-to-your-pem-key> ubuntu@<Consumer-Public-IP> "chmod +x install-java.sh start-consumer.sh stop-consumer.sh && ./install-java.sh"
-# Step 2: Start Consumer
 ssh -i <path-to-your-pem-key> ubuntu@<Consumer-Public-IP> "./start-consumer.sh"
 ```
 
 ---
 
-### Step 4: Verify
+### Step 5: Verify
 
 ```bash
 curl http://<Server1-Public-IP>:8080/health
@@ -237,16 +273,20 @@ curl http://<Server4-Public-IP>:8080/health
 curl http://<Consumer-Public-IP>:8081/health
 ```
 
-Postgres Connection: jdbc:postgresql://54.245.187.34:5432/chatflow (User: admin / PWD: admin / DB: chatflow)
-RabbitMQ Management Console: http://\<RabbitMQ-Public-IP\>:15672 (User: admin / PWD: admin)
+| Service | Connection |
+|---|---|
+| PostgreSQL | `jdbc:postgresql://<Postgres-Public-IP>:5432/chatflow` (admin / admin) |
+| RabbitMQ Management | `http://<RabbitMQ-Public-IP>:15672` (admin / admin) |
+| ALB (WebSocket) | `ws://chat-servers-1288018322.us-west-2.elb.amazonaws.com/chat/{roomId}` |
 
 ---
 
-### Monitoring
+### Monitoring (EC2)
 
 ```bash
-# one-time snapshot
 cd monitoring
+
+# one-time snapshot
 ./check-metrics.sh
 
 # live (requires: brew install watch)
@@ -258,18 +298,44 @@ cd monitoring
 ### Stop All Services
 
 ```bash
-# Server 1
 ssh -i <path-to-your-pem-key> ubuntu@<Server1-Public-IP> "./stop-server.sh"
-# Server 2
 ssh -i <path-to-your-pem-key> ubuntu@<Server2-Public-IP> "./stop-server.sh"
-# Server 3
 ssh -i <path-to-your-pem-key> ubuntu@<Server3-Public-IP> "./stop-server.sh"
-# Server 4
 ssh -i <path-to-your-pem-key> ubuntu@<Server4-Public-IP> "./stop-server.sh"
-# Consumer
 ssh -i <path-to-your-pem-key> ubuntu@<Consumer-Public-IP> "./stop-consumer.sh"
-# Postgres
 ssh -i <path-to-your-pem-key> ubuntu@<Postgres-Public-IP> "docker-compose down -v"
-# RabbitMQ
 ssh -i <path-to-your-pem-key> ubuntu@<RabbitMQ-Public-IP> "docker-compose down -v"
+ssh -i <path-to-your-pem-key> ubuntu@<Redis-Public-IP> "docker-compose down -v"
 ```
+
+---
+
+## Load Testing (JMeter)
+
+JMeter test plans and results are in `jmeter-tests/`:
+
+| Folder | Description |
+|---|---|
+| `jmeter-tests/original/` | Baseline and stress tests against the original (unoptimized) architecture |
+| `jmeter-tests/optimized/` | Baseline and stress tests after database and caching optimizations |
+
+Test parameters: 300 threads, 100 iterations/thread, targeting `/chat/{random room 1–20}` via ALB on port 80.
+
+HTML dashboards are available in the respective `*_report-folder/` and `optimized_stress/` directories.
+
+---
+
+## Key Configuration
+
+| Parameter | Default | Location |
+|---|---|---|
+| RabbitMQ connections per server | 2 | `server-v2/application.yaml` |
+| RabbitMQ channels per connection | 25 | `server-v2/application.yaml` |
+| Consumer thread count | 40 | `consumer-v3/application.yaml` |
+| DB writer threads | 16 | `consumer-v3/application.yaml` |
+| DB batch size | 1000 messages | `consumer-v3/application.yaml` |
+| DB flush interval | 500 ms | `consumer-v3/application.yaml` |
+| Analytics refresh interval | 60 s | `consumer-v3/application.yaml` |
+| Circuit breaker failure threshold | 5 failures | `consumer-v3/application.yaml` |
+| Circuit breaker cooldown | 30 s | `consumer-v3/application.yaml` |
+| HikariCP max pool size | 20 | `consumer-v3/application.yaml` |
